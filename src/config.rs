@@ -1,0 +1,1 @@
+pub const SHIO_FEED_WS: &str=  "wss://rpc.getshio.com/feed";
