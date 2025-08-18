@@ -9,8 +9,9 @@ use crate::config::SHIO_FEED_WS;
 
 pub async fn run_pending_ws(
     tx: mpsc::UnboundedSender<String>,
+    ws_url: &str
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let url = Url::parse(SHIO_FEED_WS)?;
+    let url = Url::parse(ws_url)?;
     let (ws_stream, _resp) = connect_async(url).await?;
     println!("Connected to Shio feed: {SHIO_FEED_WS}");
 
@@ -44,7 +45,7 @@ pub async fn run_pending_ws(
                 eprintln!("Shio WS closed: {frame:?}");
                 break;
             }
-            Ok(other) => {
+            Ok(_) => {
                 // Binary frames are possible; Shio may send large object `rawContent` separately in the future
                 // println!("WS other: {other:?}");
             }
@@ -53,4 +54,41 @@ pub async fn run_pending_ws(
     }
 
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SuiCoinMetadata {
+    pub decimals: u8,
+    pub symbol: String,
+    pub name: String,
+    #[allow(dead_code, non_camel_case_types)]
+    pub iconUrl: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcResp<T> { pub result: Option<T>, pub error: Option<serde_json::Value> }
+
+pub async fn fetch_coin_metadata(
+    rpc_url: &str,
+    coin_type: &str,
+) -> Result<SuiCoinMetadata, Box<dyn std::error::Error + Send + Sync>> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "suix_getCoinMetadata",
+        "params": [ coin_type ],
+    });
+    let resp = reqwest::Client::new()
+        .post(rpc_url)
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<RpcResp<SuiCoinMetadata>>()
+        .await?;
+
+    if let Some(err) = resp.error {
+        return Err(format!("suix_getCoinMetadata error: {err}").into());
+    }
+    resp.result.ok_or_else(|| "no metadata returned".into())
 }
