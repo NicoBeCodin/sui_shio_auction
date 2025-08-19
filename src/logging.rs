@@ -1,5 +1,9 @@
 use rust_decimal::Decimal;
+use serde_json::json;
+use serde_json::Value;
+use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::error::Error;
 use std::str::FromStr;
 
 use crate::coins_registry::CoinRegistry;
@@ -124,7 +128,7 @@ pub async fn log_auction_info_with_registry(
     info: &AuctionInfo,
     registry: &mut CoinRegistry,
     coins_path: &str,
-) {
+)->Result<String, Box<dyn Error + Send + Sync>> {
     println!("\n================= 🚀 New Auction Started =================");
     println!("TxDigest   : {}", info.tx_digest);
     println!("Gas Price  : {} microunits", info.gas_price);
@@ -228,6 +232,7 @@ pub async fn log_auction_info_with_registry(
         summarize_auction_actions(info, &pool_index, /*verbose=*/ false)
     );
     println!("===========================================================\n");
+    Ok(info.tx_digest.clone())
 }
 
 fn scale_reserve(raw: Option<&str>, decimals: Option<u8>) -> String {
@@ -481,4 +486,165 @@ fn summarize_auction_actions(
     } else {
         line
     }
+}
+
+use reqwest::Client;
+/// Analyze a Shio auction result that you've already parsed into a Vec<Value>.
+/// - Detects if bids were placed
+/// - Picks the winner (highest bidAmount, tiebreaker earliest timestamp)
+/// - Fetches the winner's tx from Sui RPC and prints a MEV-oriented summary.
+pub async fn analyze_shio_auction_result(
+    events: &[Value],
+    sui_rpc: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    // 1) Collect accepted bids
+    let mut bids: Vec<(u128, String, u64)> = Vec::new(); // (amount, bidDigest, ts)
+
+    for e in events {
+        let ety = e.get("eventType").and_then(|v| v.as_str()).unwrap_or("");
+        if ety == "bid_accepted" {
+            if let (Some(amt_u64), Some(digest)) = (
+                e.get("bidAmount").and_then(|v| v.as_u64()),
+                e.get("bidDigest").and_then(|v| v.as_str()),
+            ) {
+                let ts = e.get("timestampMs").and_then(|v| v.as_u64()).unwrap_or(0);
+                bids.push((amt_u64 as u128, digest.to_string(), ts));
+            }
+        }
+    }
+
+    // 2) Winner?
+    if bids.is_empty() {
+        println!("Auction had no accepted bids (only start/end).");
+        return Ok(());
+    }
+
+    // Highest amount wins; tie-break by earlier timestamp
+    bids.sort_by(|a, b| {
+        match a.0.cmp(&b.0) {
+            Ordering::Less => Ordering::Greater,
+            Ordering::Greater => Ordering::Less,
+            Ordering::Equal => a.2.cmp(&b.2),
+        }
+    });
+
+    let (win_amt, win_digest, win_ts) = bids[0].clone();
+    println!("✅ Winner: {win_digest} with bid amount {win_amt} (ts={win_ts})");
+    if bids.len() > 1 {
+        println!("   Other accepted bids:");
+        for (i, (amt, d, ts)) in bids.iter().enumerate().skip(1) {
+            println!("   {i}. {d}  amount={amt} ts={ts}");
+        }
+    }
+
+    // 3) Pull the winner’s tx from Sui RPC and explain
+    let tx = get_tx_with_details(&Client::new(), sui_rpc, &win_digest).await?;
+    explain_mev_from_tx(&tx);
+
+    Ok(())
+}
+
+/// Fetch a transaction block with all useful details for analysis.
+async fn get_tx_with_details(
+    client: &Client,
+    sui_rpc: &str,
+    digest: &str,
+) -> Result<Value, Box<dyn Error + Send + Sync>> {
+    use serde_json::json;
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sui_getTransactionBlock",
+        "params": [
+            digest,
+            {
+                "showInput": true,
+                "showEffects": true,
+                "showEvents": true,
+                "showObjectChanges": true,
+                "showBalanceChanges": true
+            }
+        ]
+    });
+
+    let resp = client.post(sui_rpc).json(&req).send().await?;
+    let v: Value = resp.error_for_status()?.json().await?;
+    let result = v.get("result").cloned().ok_or("missing result in Sui RPC response")?;
+    Ok(result)
+}
+
+/// Heuristic explanation of MEV: identify swaps/flash-repay pattern and net deltas.
+fn explain_mev_from_tx(tx: &Value) {
+    println!("\n—— MEV Analysis (winner tx) ——");
+
+    // 1) Swaps & repayments
+    if let Some(events) = tx.get("events").and_then(|e| e.as_array()) {
+        let mut saw_swap = false;
+        let mut saw_repay = false;
+
+        for (i, e) in events.iter().enumerate() {
+            let ety = e.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let parsed = e.get("parsedJson");
+
+            if ety.ends_with("::trade::SwapEvent") {
+                saw_swap = true;
+                let pool = parsed.and_then(|p| p.get("pool_id")).and_then(|v| v.as_str()).unwrap_or("?");
+                let x = parsed.and_then(|p| p.get("amount_x")).and_then(|v| v.as_str()).unwrap_or("-");
+                let y = parsed.and_then(|p| p.get("amount_y")).and_then(|v| v.as_str()).unwrap_or("-");
+                let dir = parsed.and_then(|p| p.get("x_for_y")).and_then(|v| v.as_bool()).unwrap_or(true);
+                let before = parsed.and_then(|p| p.get("sqrt_price_before")).and_then(|v| v.as_str()).unwrap_or("-");
+                let after  = parsed.and_then(|p| p.get("sqrt_price_after")).and_then(|v| v.as_str()).unwrap_or("-");
+                println!(
+                    "  • SwapEvent[{i}] pool={pool} amounts: X={x}, Y={y}, dir={}  √P(before→after)={before}→{after}",
+                    if dir { "X→Y" } else { "Y→X" }
+                );
+            } else if ety.ends_with("::trade::RepayFlashSwapEvent") {
+                saw_repay = true;
+                let pool = parsed.and_then(|p| p.get("pool_id")).and_then(|v| v.as_str()).unwrap_or("?");
+                let x_debt = parsed.and_then(|p| p.get("amount_x_debt")).and_then(|v| v.as_str()).unwrap_or("-");
+                let y_debt = parsed.and_then(|p| p.get("amount_y_debt")).and_then(|v| v.as_str()).unwrap_or("-");
+                println!("  • RepayFlashSwapEvent[{i}] pool={pool} repay: X_debt={x_debt} Y_debt={y_debt}");
+            } else if ety.ends_with("::events::AssetSwap")
+                || ety.ends_with("::bluefin::BluefinSwapEvent")
+                || ety.ends_with("::settle::Swap")
+            {
+                println!("  • DEX/Settle event[{i}]: {ety} (see parsedJson for route-specific fields)");
+            }
+        }
+
+        if saw_swap && saw_repay {
+            println!("  › Pattern: flash-swap style routing (borrow, swap, then repay) — classic atomic MEV.");
+        }
+    } else {
+        println!("  (No on-chain events present in tx.)");
+    }
+
+    // 2) Net PnL hints
+    if let Some(bal) = tx.get("balanceChanges").and_then(|b| b.as_array()) {
+        println!("\n  Balance changes:");
+        for bc in bal {
+            let owner = bc.get("owner").and_then(|o| o.get("AddressOwner")).and_then(|v| v.as_str()).unwrap_or("?");
+            let ctype = bc.get("coinType").and_then(|v| v.as_str()).unwrap_or("?");
+            let amt = bc.get("amount").and_then(|v| v.as_str()).unwrap_or("0");
+            println!("    • {owner}  {ctype}  Δ={amt}");
+        }
+        println!("  (Positive Δ in a quote token after repaying debt suggests captured spread/arb.)");
+    }
+
+    // 3) Pools touched
+    if let Some(ch) = tx.get("objectChanges").and_then(|c| c.as_array()) {
+        let pools: Vec<_> = ch.iter()
+            .filter_map(|c| c.get("objectType").and_then(|t| t.as_str()))
+            .filter(|t| t.contains("::pool::Pool<"))
+            .collect();
+        if !pools.is_empty() {
+            println!("\n  Pools touched:");
+            for p in pools {
+                println!("    • {p}");
+            }
+        }
+    }
+
+    println!("\n  Verdict: Winner likely routed swaps (possibly multi-hop), repaid flash debt, and kept the spread (MEV).");
+    std::process::exit(0);
 }

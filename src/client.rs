@@ -1,3 +1,6 @@
+use std::error::Error;
+
+use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -5,7 +8,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use url::Url;
 
-use crate::config::SHIO_FEED_WS;
+use crate::config::{SHIO_FEED_WS, SHIO_RPC_URL};
 
 pub async fn run_pending_ws(
     tx: mpsc::UnboundedSender<String>,
@@ -62,7 +65,7 @@ pub struct SuiCoinMetadata {
     pub symbol: String,
     pub name: String,
     #[allow(dead_code, non_camel_case_types)]
-    pub iconUrl: Option<String>,
+    pub icon_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,4 +94,98 @@ pub async fn fetch_coin_metadata(
         return Err(format!("suix_getCoinMetadata error: {err}").into());
     }
     resp.result.ok_or_else(|| "no metadata returned".into())
+}
+
+
+#[derive(Debug, Deserialize)]
+struct RpcError {
+    code: i64,
+    message: String,
+    #[serde(default)]
+    data: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RpcEnvelope {
+    Ok { jsonrpc: String, id: Value, result: Value },
+    Err { jsonrpc: String, id: Value, error: RpcError },
+}
+
+
+/// Fetch persisted auction events for a given opportunity tx digest.
+///
+/// `digest` is the *opportunity transaction digest* (the one you print as `TxDigest: ...`).
+/// Returns the raw `result` as `Vec<Value>`; each item is a Shio event object.
+/// Rejected bids are not included (per Shio’s docs).
+pub async fn get_shio_auction_events(
+    digest: &String,
+) -> Result<Vec<Value>, Box<dyn Error + Send + Sync>> {
+    // Basic input check
+    if digest.trim().is_empty() {
+        return Err("empty digest".into());
+    }
+
+    // JSON-RPC request body
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "shio_auctionEvents",
+        "params": [ digest ],
+    });
+
+    // light retry/backoff for transient errors
+    let mut last_err: Option<reqwest::Error> = None;
+    for attempt in 0..3 {
+        let resp = reqwest::Client::new()
+            .post(SHIO_RPC_URL)
+            .json(&body)
+            .send()
+            .await;
+
+        match resp {
+            Ok(r) => {
+                let status_err = r.error_for_status();
+                match status_err {
+                    Ok(ok) => {
+                        let env: RpcEnvelope = ok.json().await?;
+                        match env {
+                            RpcEnvelope::Ok { result, .. } => {
+                                // Expect an array of event objects
+                                let arr = result.as_array()
+                                    .cloned()
+                                    .ok_or("RPC result is not an array")?;
+                                return Ok(arr);
+                            }
+                            RpcEnvelope::Err { error, .. } => {
+                                // Permanent RPC error; don’t keep retrying unless it’s a  -32000-ish transient
+                                return Err(format!(
+                                    "RPC error {}: {}{}",
+                                    error.code,
+                                    error.message,
+                                    error.data
+                                        .as_ref()
+                                        .map(|d| format!(" ({d})"))
+                                        .unwrap_or_default()
+                                ).into());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                    }
+                }
+            }
+            Err(e) => {
+                last_err = Some(e);
+            }
+        }
+
+        // Backoff before next attempt (100ms, 300ms)
+        if attempt < 2 {
+            tokio::time::sleep(Duration::from_millis(100 + attempt * 200)).await;
+        }
+    }
+
+    Err(format!("failed to fetch shio_auctionEvents after retries: {last_err:?}").into())
 }
